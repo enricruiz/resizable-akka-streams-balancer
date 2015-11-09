@@ -17,9 +17,10 @@ import akka.actor.Props;
 import akka.actor.Terminated;
 import akka.dispatch.Mapper;
 import akka.dispatch.Recover;
-import akka.japi.Pair;
 import akka.japi.pf.ReceiveBuilder;
 import akka.pattern.Patterns;
+import akka.stream.FlowShape;
+import akka.stream.Graph;
 import akka.stream.Materializer;
 import akka.stream.OverflowStrategy;
 import akka.stream.UniformFanInShape;
@@ -29,6 +30,7 @@ import akka.stream.actor.ActorSubscriberMessage.OnNext;
 import akka.stream.actor.RequestStrategy;
 import akka.stream.javadsl.Balance;
 import akka.stream.javadsl.Flow;
+import akka.stream.javadsl.FlowGraph;
 import akka.stream.javadsl.Merge;
 import akka.stream.javadsl.RunnableGraph;
 import akka.stream.javadsl.Sink;
@@ -143,23 +145,23 @@ public class MailMaster extends AbstractActorSubscriber
 
     private RunnableGraph<ActorRef> createBalancer(Set<ActorRef> workers)
     {
-        Flow<Object, Object, BoxedUnit> flow =
-            Flow.factory().create(
-                b -> {
-                    UniformFanOutShape<Messages.SendEmailJob, Messages.SendEmailJob> balance =
-                        b.graph(Balance.<Messages.SendEmailJob> create(workers.size()));
+        Graph<FlowShape<Messages.SendEmailJob, Messages.DeliveryStatus>, BoxedUnit> flow =
+            FlowGraph.create(b -> {
+                UniformFanOutShape<Messages.SendEmailJob, Messages.SendEmailJob> balance =
+                    b.add(Balance.create(workers.size()));
 
-                    UniformFanInShape<Messages.DeliveryStatus, Messages.DeliveryStatus> merge =
-                        b.graph(Merge.<Messages.DeliveryStatus> create(workers.size()));
+                UniformFanInShape<Messages.DeliveryStatus, Messages.DeliveryStatus> merge =
+                    b.add(Merge.create(workers.size()));
 
-                    workers.forEach(w -> b.from(balance).via(sendToWorker(w)).to(merge));
+                workers.forEach(worker -> b.from(balance) //
+                    .via(b.add(sendToWorker(worker))) //
+                    .toFanIn(merge));
 
-                    return new Pair(balance.in(), merge.out());
-                });
+                return FlowShape.of(balance.in(), merge.out());
+            });
 
-        Source<Object, ActorRef> source = Source.actorRef(2 * maxQueueSize() //
+        Source<Messages.SendEmailJob, ActorRef> source = Source.actorRef(2 * maxQueueSize() //
             , OverflowStrategy.fail());
-
         return source.via(flow).to(Sink.ignore());
     }
 
