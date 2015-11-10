@@ -48,7 +48,9 @@ public class MailMaster extends AbstractActorSubscriber
 
     private int parallelism = 1;
 
-    private Map<Integer, Messages.SendEmailJob> mailQueue = new HashMap<>();
+    private Map<Integer, Messages.SendEmailJob> pending = new HashMap<>();
+
+    private Map<Integer, Messages.SendEmailJob> started = new HashMap<>();
 
     private int currentEmailId = 0;
 
@@ -77,9 +79,11 @@ public class MailMaster extends AbstractActorSubscriber
             int emailJobId = getNewId();
             Messages.SendEmailJob job = new Messages.SendEmailJob(emailJobId, //
                 (Messages.Email) n.element());
-            mailQueue.put(emailJobId, job);
-            assert mailQueue.size() <= maxQueueSize();
-        }).match(Messages.MailSenderRegistration.class, r -> {
+            pending.put(emailJobId, job);
+            System.out.println("New job enqueud: " + emailJobId);
+        })
+
+        .match(Messages.MailSenderRegistration.class, r -> {
             ActorRef newWorker = getContext().watch(sender());
             Set<ActorRef> workers = new HashSet<>();
             workers.add(newWorker);
@@ -93,27 +97,37 @@ public class MailMaster extends AbstractActorSubscriber
         return match(Terminated.class, a -> {
             workers.remove(a);
             updateWorkers(workers, balancer);
-        }).match(Messages.MailSenderRegistration.class, a -> {
+        })
+
+        .match(Messages.MailSenderRegistration.class, a -> {
             workers.add(context().watch(sender()));
             updateWorkers(workers, balancer);
-        }).match(OnNext.class, e -> {
+        })
+
+        .match(OnNext.class, e -> {
             int emailJobId = getNewId();
             Messages.SendEmailJob job = new Messages.SendEmailJob(emailJobId, //
                 (Messages.Email) e.element());
-            mailQueue.put(emailJobId, job);
-            assert mailQueue.size() <= maxQueueSize();
+            started.put(emailJobId, job);
             balancer.tell(job, context().self());
-        }).match(Messages.EmailSent.class, e -> {
-            mailQueue.remove(e.id);
-        }).match(Messages.EmailFailed.class, e -> {
-            mailQueue.remove(e.id);
+        })
+
+        .match(Messages.EmailSent.class, e -> {
+            System.out.println("Done and removed!");
+            started.remove(e.id);
+        })
+
+        .match(Messages.EmailFailed.class, e -> {
+            System.out.println("Done and failed");
+            started.remove(e.id);
         }).build();
     }
 
     @Override
     public RequestStrategy requestStrategy()
     {
-        return new DynamicMaxInFlightRequestStrategy(maxQueueSize(), mailQueue.size());
+        return new DynamicMaxInFlightRequestStrategy(maxQueueSize(), started.size()
+            + pending.size());
     }
 
     private Flow<Messages.SendEmailJob, Messages.DeliveryStatus, BoxedUnit> sendToWorker(
@@ -162,7 +176,13 @@ public class MailMaster extends AbstractActorSubscriber
 
         Source<Messages.SendEmailJob, ActorRef> source = Source.actorRef(2 * maxQueueSize() //
             , OverflowStrategy.fail());
-        return source.via(flow).to(Sink.ignore());
+
+        return source.via(flow).to(Sink.actorRef(self(), Completed.INTANCE));
+    }
+
+    private enum Completed
+    {
+        INTANCE
     }
 
     private void updateWorkers(Set<ActorRef> newWorkers, ActorRef oldBalancer)
@@ -179,6 +199,14 @@ public class MailMaster extends AbstractActorSubscriber
         {
             ActorRef newBalancer = createBalancer(newWorkers).run(materializer);
             context().become(hasWorkers(newWorkers, newBalancer));
+
+            if (!pending.isEmpty())
+            {
+                // Start all pending jobs
+                started.putAll(pending);
+                pending.clear();
+                pending.forEach((uuid, job) -> newBalancer.tell(job, self()));
+            }
         }
         else
         {
